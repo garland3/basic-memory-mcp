@@ -1,8 +1,11 @@
+import json
+
+import basic_memory_mcp.store as store  # type: ignore
 import pytest
+from fastmcp.exceptions import ToolError
 
 from basic_memory_mcp.config import ServerConfig, set_config
-from basic_memory_mcp.server import delete, discover_topics, edit, mcp, read, register_tools, write
-from fastmcp.exceptions import ToolError
+from basic_memory_mcp.server import (append, delete, discover_topics, edit, mcp, read, register_tools, related, rename, sweep, write)
 
 
 @pytest.fixture(autouse=True)
@@ -164,4 +167,137 @@ async def test_read_only_registers_only_read_tools(tmp_path):
     register_tools(c)
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
-    assert names == {"discover_topics", "read"}
+    assert names == {"discover_topics", "read", "related"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 tools
+
+
+def test_append_adds_text_to_existing_topic(cfg):
+    write(topic_id="journal", content="first entry")
+    out = append(topic_id="journal", text="second entry")
+    assert "journal: appended" == out
+    raw = read(topic_id="journal")
+    assert "second entry" in raw
+
+
+def test_append_under_heading(cfg):
+    write(topic_id="log", content="## Tasks\nalpha")
+    append(topic_id="log", text="beta", heading="Tasks")
+    raw = read(topic_id="log")
+    body = store._decode_file(cfg.root / "log.md")[1]  # type: ignore[attr-defined]
+    assert "alpha" in body and "beta" in body
+    assert body.index("alpha") < body.index("beta")
+
+
+def test_append_fails_missing_topic(cfg):
+    with pytest.raises(ToolError, match="discover_topics"):
+        append(topic_id="missing", text="nope")
+
+
+def test_related_reports_link_graph(cfg):
+    write(topic_id="hub", content="see [[spoke]]")
+    write(topic_id="spoke", content="back to [[hub]]")
+    out = related(topic_id="hub")
+    assert "spoke" in out
+    data = json.loads(out)
+    assert data["outbound"] == ["spoke"]
+    assert data["inbound"] == ["spoke"]
+
+
+def test_rename_moves_and_rewrites_links(cfg):
+    write(topic_id="people/garland", content="Anthony")
+    write(topic_id="projects/team", content="Member: [[people/garland]]")
+    out = rename(old_id="people/garland", new_id="people/anthony-garland")
+    assert "people/garland -> people/anthony-garland" in out
+    assert "1 wiki links" in out
+    team_text = read(topic_id="projects/team")
+    assert "[[people/anthony-garland]]" in team_text
+
+
+async def test_memory_resource_reads_nested_topic(cfg):
+    write(topic_id="users/anthony-garland", content="Anthony Garland")
+    result = await mcp.read_resource("memory://users/anthony-garland")
+    assert "Anthony Garland" in result.contents[0].content
+
+
+async def test_memory_resources_listed_include_nested_topics(cfg):
+    write(topic_id="claude/skills-directory", content="Skills")
+    # register_tools/_refresh_catalog registers concrete memory:// resources on write.
+    resources = await mcp.list_resources()
+    uris = {str(r.uri) for r in resources}
+    assert "memory://claude/skills-directory" in uris
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — retention (§12)
+
+
+def test_write_retention_is_stored(cfg):
+    write(topic_id="note", content="body", retention="today")
+    raw = read(topic_id="note")
+    assert "expires:" in raw
+    assert "never" not in raw or "T" in raw  # today => absolute datetime
+
+
+def test_write_permanent_default(cfg):
+    write(topic_id="note", content="body")
+    raw = read(topic_id="note")
+    assert "expires: never" in raw
+
+
+def test_discover_reports_expired_hidden(cfg):
+    write(topic_id="old", content="expired body", retention="2000-01-01T00:00:00Z")
+    out = discover_topics()
+    assert "expired topics hidden" in out
+    assert "pass include_expired=true" in out
+
+
+def test_discover_include_expired_reveals_them(cfg):
+    write(topic_id="old", content="expired body", retention="2000-01-01T00:00:00Z")
+    out = discover_topics(include_expired=True)
+    assert '"expired": true' in out
+
+
+def test_sweep_dry_run_then_delete(cfg):
+    write(topic_id="old", content="expired body", retention="2000-01-01T00:00:00Z")
+    out = sweep(dry_run=True)
+    assert "old" in out
+    assert "dry run" in out
+    assert read(topic_id="old")
+
+    out = sweep(dry_run=False)
+    assert "Swept topics" in out
+    assert "old" in out
+    with pytest.raises(ToolError, match="discover_topics"):
+        read(topic_id="old")
+
+
+def test_append_preserved_expiry_when_retention_omitted(cfg):
+    write(topic_id="note", content="body", retention="2099-01-01T00:00:00Z")
+    append(topic_id="note", text="more")
+    raw = read(topic_id="note")
+    assert "2099-01-01" in raw
+
+
+def test_sweep_invalid_retention_raises(cfg):
+    with pytest.raises(ToolError, match="invalid retention"):
+        write(topic_id="bad", content="body", retention="nonsense")
+
+
+async def test_read_only_does_not_register_sweep(tmp_path):
+    c = ServerConfig(
+        root=tmp_path.resolve(),
+        read_only=True,
+        hard_delete=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    set_config(c)
+    register_tools(c)
+    tools = await mcp.list_tools()
+    names = {t.name for t in tools}
+    assert "sweep" not in names
+
+

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -124,7 +125,7 @@ def test_edit_multiple_requires_replace_all(tmp_path: Path) -> None:
 def test_discover_topics_no_filter(tmp_path: Path) -> None:
     store.write_topic("a/first", "one", tmp_path)
     store.write_topic("b/second", "two", tmp_path)
-    topics, total = store.discover_topics(tmp_path, limit=10)
+    topics, total, _hidden = store.discover_topics(tmp_path, limit=10)
     assert total == 2
     ids = {t["id"] for t in topics}
     assert ids == {"a/first", "b/second"}
@@ -133,7 +134,7 @@ def test_discover_topics_no_filter(tmp_path: Path) -> None:
 def test_discover_topics_by_query(tmp_path: Path) -> None:
     store.write_topic("first", "alpha", tmp_path, title="One")
     store.write_topic("second", "beta", tmp_path, title="Two")
-    topics, total = store.discover_topics(tmp_path, query="beta", limit=10)
+    topics, total, _hidden = store.discover_topics(tmp_path, query="beta", limit=10)
     assert total == 1
     assert topics[0]["id"] == "second"
 
@@ -141,7 +142,7 @@ def test_discover_topics_by_query(tmp_path: Path) -> None:
 def test_discover_topics_by_tag(tmp_path: Path) -> None:
     store.write_topic("first", "a", tmp_path, tags=["x"])
     store.write_topic("second", "b", tmp_path, tags=["y"])
-    topics, _ = store.discover_topics(tmp_path, tag="x", limit=10)
+    topics, _total, _hidden = store.discover_topics(tmp_path, tag="x", limit=10)
     assert len(topics) == 1
     assert topics[0]["id"] == "first"
 
@@ -149,7 +150,7 @@ def test_discover_topics_by_tag(tmp_path: Path) -> None:
 def test_discover_topics_limit_reports_truncation(tmp_path: Path) -> None:
     for i in range(5):
         store.write_topic(f"topic{i}", f"content {i}", tmp_path)
-    topics, total = store.discover_topics(tmp_path, limit=2)
+    topics, total, _hidden = store.discover_topics(tmp_path, limit=2)
     assert len(topics) == 2
     assert total == 5
 
@@ -267,7 +268,7 @@ def test_discover_topics_ranks_title_and_id_hits_first(tmp_path: Path) -> None:
     store.write_topic("search-results", "irrelevant body", tmp_path, title="Search Results")
     # alpha was written second but is a body-only hit; it should still fall below
     # search-results because a title/id hit is ranked higher.
-    topics, total = store.discover_topics(tmp_path, query="search", limit=10)
+    topics, total, _hidden = store.discover_topics(tmp_path, query="search", limit=10)
     assert total == 2
     ids = [t["id"] for t in topics]
     assert ids[0] == "search-results"
@@ -276,6 +277,270 @@ def test_discover_topics_ranks_title_and_id_hits_first(tmp_path: Path) -> None:
 
 def test_discover_topics_returns_outbound_links(tmp_path: Path) -> None:
     store.write_topic("hub", " Points to [[people/garland]] and [[projects/atlas-ports]].", tmp_path)
-    topics, total = store.discover_topics(tmp_path, limit=10)
+    topics, total, _hidden = store.discover_topics(tmp_path, limit=10)
     assert total == 1
     assert topics[0]["outbound_links"] == ["people/garland", "projects/atlas-ports"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 features
+
+
+def test_append_topic_adds_text(tmp_path: Path) -> None:
+    store.write_topic("note", "first line", tmp_path, title="Note")
+    store.append_topic("note", "second line", tmp_path)
+    raw = (tmp_path / "note.md").read_text()
+    assert "first line" in raw
+    assert "second line" in raw
+    # exactly one blank line between original body and appended text
+    assert "\n\nsecond line" in raw
+
+
+def test_append_under_existing_heading(tmp_path: Path) -> None:
+    store.write_topic("note", "## Log\nalpha", tmp_path)
+    store.append_topic("note", "beta", tmp_path, heading="Log")
+    raw = (tmp_path / "note.md").read_text()
+    assert raw.index("alpha") < raw.index("beta")
+    # beta is still under the Log heading
+    assert "## Log" in raw
+
+
+def test_append_creates_heading_when_missing(tmp_path: Path) -> None:
+    store.write_topic("note", "alpha", tmp_path)
+    store.append_topic("note", "beta", tmp_path, heading="Log")
+    raw = (tmp_path / "note.md").read_text()
+    assert "## Log" in raw
+    assert "beta" in raw
+
+
+def test_append_fails_missing_topic(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="discover_topics"):
+        store.append_topic("missing", "text", tmp_path)
+
+
+def test_append_bumps_updated(tmp_path: Path) -> None:
+    store.write_topic("note", "body", tmp_path)
+    before = store.load_topic("note", tmp_path)["updated"]
+    import time
+    time.sleep(1.2)
+    store.append_topic("note", "more", tmp_path)
+    after = store.load_topic("note", tmp_path)["updated"]
+    assert after > before
+
+
+def test_append_size_guard(tmp_path: Path) -> None:
+    store.write_topic("note", "x", tmp_path)
+    big = "x" * (store.MAX_TOPIC_BYTES + 10)
+    with pytest.raises(ValueError, match="exceed"):
+        store.append_topic("note", big, tmp_path)
+
+
+def test_related_outbound_and_inbound(tmp_path: Path) -> None:
+    store.write_topic("hub", "links to [[spoke/one]] and [[spoke/two]]", tmp_path)
+    store.write_topic("spoke/one", "spoke one", tmp_path)
+    store.write_topic("spoke/two", "back to [[hub]]", tmp_path)
+    rel = store.related_topics("hub", tmp_path)
+    assert rel["outbound"] == ["spoke/one", "spoke/two"]
+    assert "spoke/two" in rel["inbound"]
+    assert rel["id"] == "hub"
+
+
+def test_rename_moves_file_and_rewrites_links(tmp_path: Path) -> None:
+    store.write_topic("people/garland", "Anthony Garland", tmp_path)
+    store.write_topic("hub", "link to [[people/garland]]", tmp_path)
+    result = store.rename_topic("people/garland", "people/tony-garland", tmp_path)
+    assert result["old_id"] == "people/garland"
+    assert result["new_id"] == "people/tony-garland"
+    assert result["link_rewrites"] == 1
+    assert not (tmp_path / "people" / "garland.md").exists()
+    assert (tmp_path / "people" / "tony-garland.md").exists()
+    hub_text = (tmp_path / "hub.md").read_text()
+    assert "[[people/tony-garland]]" in hub_text
+    assert "[[people/garland]]" not in hub_text
+
+
+def test_rename_rewrites_prefix_links(tmp_path: Path) -> None:
+    store.write_topic("scratch/a", "note a", tmp_path)
+    store.write_topic("scratch/b", "note b", tmp_path)
+    store.write_topic("hub", "See [[scratch/a]] and [[scratch/b|b]].", tmp_path)
+    result = store.rename_topic("scratch", "archive/scratch", tmp_path)
+    hub_text = (tmp_path / "hub.md").read_text()
+    assert result["link_rewrites"] == 2
+    assert "[[archive/scratch/a]]" in hub_text
+    assert "[[archive/scratch/b|b]]" in hub_text
+    assert "[[scratch/" not in hub_text
+
+
+def test_rename_refuses_existing_target(tmp_path: Path) -> None:
+    store.write_topic("a", "a", tmp_path)
+    store.write_topic("b", "b", tmp_path)
+    with pytest.raises(FileExistsError, match="already exists"):
+        store.rename_topic("a", "b", tmp_path)
+
+
+def test_prime_catalog(tmp_path: Path) -> None:
+    store.write_topic("projects/atlas", "Atlas", tmp_path, title="ATLAS project")
+    store.write_topic("people/garland", "Garland", tmp_path, title="Anthony Garland")
+    text, truncated = store.prime_catalog(tmp_path)
+    assert "projects/atlas" in text
+    assert "ATLAS project" in text
+    assert not truncated
+
+
+def test_prime_catalog_truncated_by_bytes(tmp_path: Path) -> None:
+    store.write_topic("a", "x", tmp_path, title="A")
+    store.write_topic("b", "x", tmp_path, title="B")
+    text, truncated = store.prime_catalog(tmp_path, max_topics=10, max_bytes=6)
+    # Should keep no more than fits in tiny budget and report truncation.
+    assert len(text.encode("utf-8")) <= 6 or text == ""
+    assert truncated
+
+
+def test_prime_catalog_truncated_by_count(tmp_path: Path) -> None:
+    for i in range(5):
+        store.write_topic(f"topic{i}", f"body {i}", tmp_path, title=f"Title {i}")
+    text, truncated = store.prime_catalog(tmp_path, max_topics=3, max_bytes=100000)
+    assert truncated
+    assert len(text.splitlines()) <= 3
+
+
+def test_append_heading_preserves_blank_line_before_next_heading(tmp_path: Path) -> None:
+    store.write_topic(
+        "note",
+        "## Log\nalpha\n\n## Other\nomega",
+        tmp_path,
+    )
+    store.append_topic("note", "beta", tmp_path, heading="Log")
+    body = store._decode_file(tmp_path / "note.md")[1]  # type: ignore[attr-defined]
+    # There must be a blank line before the next heading.
+    assert "\n\n## Other" in body
+    assert "beta\n\n## Other" in body or "beta\n## Other" not in body
+
+
+def test_discover_multi_term_and_ranking(tmp_path: Path) -> None:
+    store.write_topic("atlas", "atlas ports map", tmp_path, title="Atlas ports")  # title hit + body
+    store.write_topic("misc", "something atlas then ports", tmp_path, title="Other")  # body hit
+    topics, total, _hidden = store.discover_topics(tmp_path, query="atlas ports", limit=10)
+    assert total == 2
+    ids = [t["id"] for t in topics]
+    # atlas hits both terms in title; misc only in body, so atlas ranks first.
+    assert ids[0] == "atlas"
+    assert ids[1] == "misc"
+
+
+def test_discover_quoted_phrase_only(tmp_path: Path) -> None:
+    store.write_topic("atlas", "atlas ports map", tmp_path, title="Atlas")
+    store.write_topic("other", "atlas and ports", tmp_path, title="Other")
+    topics, total, _hidden = store.discover_topics(tmp_path, query='"atlas ports"', limit=10)
+    assert total == 1
+    assert topics[0]["id"] == "atlas"
+
+
+def test_discover_match_centered_snippet(tmp_path: Path) -> None:
+    long = "\n".join([f"line {i}" for i in range(50)])
+    store.write_topic("note", long + "\nneedle here", tmp_path)
+    topics, total, _hidden = store.discover_topics(tmp_path, query="needle", limit=10)
+    assert total == 1
+    snippet = topics[0]["snippet"]
+    assert "needle" in snippet
+    assert "line 0" not in snippet
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — retention (§12)
+
+
+def test_write_topic_default_retention_is_permanent(tmp_path: Path) -> None:
+    store.write_topic("note", "body", tmp_path, title="Note")
+    fm, _ = store._decode_file(tmp_path / "note.md")  # type: ignore[attr-defined]
+    assert fm.get("expires") == "never"
+
+
+def test_write_topic_retention_session_is_24h(tmp_path: Path) -> None:
+    before = datetime.now(timezone.utc)
+    store.write_topic("note", "body", tmp_path, retention="session")
+    fm, _ = store._decode_file(tmp_path / "note.md")  # type: ignore[attr-defined]
+    expires = datetime.fromisoformat(str(fm["expires"]).replace("Z", "+00:00"))
+    delta = expires - before
+    assert timedelta(hours=23) < delta < timedelta(hours=25)
+
+
+def test_write_topic_retention_iso_date(tmp_path: Path) -> None:
+    store.write_topic("note", "body", tmp_path, retention="2026-08-10")
+    fm, _ = store._decode_file(tmp_path / "note.md")  # type: ignore[attr-defined]
+    assert str(fm["expires"]).startswith("2026-08-10")
+
+
+def test_append_extends_expiry(tmp_path: Path) -> None:
+    store.write_topic("note", "body", tmp_path, retention="2026-08-10T00:00:00Z")
+    store.append_topic("note", "more", tmp_path, retention="2026-09-01T00:00:00Z")
+    fm, _ = store._decode_file(tmp_path / "note.md")  # type: ignore[attr-defined]
+    assert str(fm["expires"]).startswith("2026-09-01")
+
+
+def test_append_does_not_shorten_expiry(tmp_path: Path) -> None:
+    store.write_topic("note", "body", tmp_path, retention="2026-09-01T00:00:00Z")
+    store.append_topic("note", "more", tmp_path, retention="2026-08-10T00:00:00Z")
+    fm, _ = store._decode_file(tmp_path / "note.md")  # type: ignore[attr-defined]
+    assert str(fm["expires"]).startswith("2026-09-01")
+
+
+def test_append_to_permanent_does_not_shorten(tmp_path: Path) -> None:
+    store.write_topic("note", "body", tmp_path)
+    store.append_topic("note", "more", tmp_path, retention="today")
+    fm, _ = store._decode_file(tmp_path / "note.md")  # type: ignore[attr-defined]
+    assert fm.get("expires") == "never"
+
+
+def test_discover_hides_expired_by_default(tmp_path: Path) -> None:
+    store.write_topic("permanent", "perm", tmp_path, retention="permanent")
+    store.write_topic("expired", "old", tmp_path, retention="2000-01-01T00:00:00Z")
+    topics, total, hidden = store.discover_topics(tmp_path)
+    assert total == 1
+    assert hidden == 1
+    assert {t["id"] for t in topics} == {"permanent"}
+
+
+def test_discover_include_expired_marks_them(tmp_path: Path) -> None:
+    store.write_topic("expired", "old", tmp_path, retention="2000-01-01T00:00:00Z")
+    topics, total, hidden = store.discover_topics(tmp_path, include_expired=True)
+    assert total == 1 and hidden == 0
+    assert topics[0]["expired"] is True
+
+
+def test_sweep_dry_run_then_delete(tmp_path: Path) -> None:
+    store.write_topic("old", "old", tmp_path, retention="2000-01-01T00:00:00Z")
+    ids = store.sweep_expired(tmp_path, dry_run=True)
+    assert ids == ["old"]
+    assert (tmp_path / "old.md").exists()
+    deleted = store.sweep_expired(tmp_path, dry_run=False)
+    assert "old" in deleted
+    assert not (tmp_path / "old.md").exists()
+    assert (tmp_path / ".trash").exists()
+
+
+def test_prime_catalog_skips_expired(tmp_path: Path) -> None:
+    store.write_topic("a", "a", tmp_path, retention="permanent")
+    store.write_topic("b", "b", tmp_path, retention="2000-01-01T00:00:00Z")
+    text, _ = store.prime_catalog(tmp_path)
+    assert "a" in text
+    assert "b" not in text
+
+
+def test_malformed_expires_treated_as_permanent(tmp_path: Path) -> None:
+    (tmp_path / "bad.md").write_text("---\nexpires: not-a-date\n---\nbody")
+    topics, total, hidden = store.discover_topics(tmp_path)
+    assert total == 1 and hidden == 0
+    assert topics[0]["id"] == "bad"
+
+
+def test_read_still_reads_expired(tmp_path: Path) -> None:
+    store.write_topic("old", "old", tmp_path, retention="2000-01-01T00:00:00Z")
+    raw = store.read_topic("old", tmp_path)
+    assert "old" in raw
+
+
+def test_invalid_retention_raises(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid retention"):
+        store.write_topic("x", "x", tmp_path, retention="nonsense")
+

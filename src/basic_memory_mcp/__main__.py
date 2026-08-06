@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import store
 from .config import ServerConfig, set_config
 from .server import mcp, register_tools
 
@@ -39,6 +40,7 @@ def main() -> None:
         "port": _env_int("BASIC_MEMORY_PORT", 8101),
         "read_only": _env_bool("BASIC_MEMORY_READ_ONLY", False),
         "hard_delete": _env_bool("BASIC_MEMORY_HARD_DELETE", False),
+        "sweep_on_start": _env_bool("BASIC_MEMORY_SWEEP_ON_START", False),
     }
 
     parser = argparse.ArgumentParser(
@@ -54,12 +56,17 @@ def main() -> None:
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Disable write/edit/delete tools",
+        help="Disable write/edit/delete/sweep tools",
     )
     parser.add_argument(
         "--hard-delete",
         action="store_true",
         help="Permanently delete files instead of moving to .trash (test roots only)",
+    )
+    parser.add_argument(
+        "--sweep-on-start",
+        action="store_true",
+        help="Sweep expired topics into .trash on startup",
     )
     parser.add_argument(
         "--host",
@@ -103,12 +110,18 @@ def main() -> None:
         root=root,
         read_only=defaults["read_only"] or args.read_only,
         hard_delete=defaults["hard_delete"] or args.hard_delete,
+        sweep_on_start=defaults["sweep_on_start"] or args.sweep_on_start,
         host=args.host,
         port=args.port,
     )
 
     set_config(cfg)
     register_tools(cfg)
+
+    if cfg.sweep_on_start:
+        swept = store.sweep_expired(cfg.root, dry_run=False)
+        if swept:
+            print(f"basic-memory-mcp: swept {len(swept)} expired topic(s)", file=sys.stderr)
 
     if transport == "http":
         mcp.run(transport="http", host=cfg.host, port=cfg.port)
