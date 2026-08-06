@@ -3,9 +3,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +13,15 @@ import yaml
 MAX_TOPIC_BYTES = 1_000_000  # ~1 MB; keeps a bad call from slowing discovery.
 
 _TRASH_DIR = ".trash"
+_SERVER_KEYS = {"created", "updated"}
 
 
 def resolve(topic_id: str, root: Path) -> Path:
     """Return the filesystem path for a topic id, or raise if invalid.
 
     Topic ids are slash-paths relative to root, without the ``.md`` extension.
-    Rejects absolute paths, parent-directory escapes, and symlinks that point
-    outside the root.
+    Rejects absolute paths, parent-directory escapes, the reserved ``.trash``
+    namespace, and symlinks that point outside the root.
     """
     if topic_id.startswith("/"):
         raise ValueError(f"topic id must be relative, got absolute path: {topic_id!r}")
@@ -29,10 +29,13 @@ def resolve(topic_id: str, root: Path) -> Path:
         raise ValueError(f"topic id must use '/' separators, got: {topic_id!r}")
     if any(part == ".." for part in topic_id.split("/")):
         raise ValueError(f"topic id cannot contain '..' : {topic_id!r}")
+    if any(part == _TRASH_DIR for part in topic_id.split("/")):
+        raise ValueError(f"{_TRASH_DIR!r} is reserved and not a valid topic id")
 
-    # Build the final file path first, then resolve, so symlinks in the leaf are
-    # actually followed before the root check.
-    path = (root / topic_id).with_suffix(".md")
+    # Build the final file path without swallowing existing dots. Using
+    # ``with_suffix`` would turn ``atlas-v1.2-config`` into ``atlas-v1.md``.
+    raw = root / topic_id
+    path = raw.parent / (raw.name + ".md")
     resolved = path.resolve()
 
     try:
@@ -63,7 +66,6 @@ def _iter_topics(root: Path) -> list[Path]:
                 continue
             if str(rel) == "index.md":
                 continue
-            # Skip hidden directories cleanly by checking resolved path.
             results.append(path)
     return results
 
@@ -96,11 +98,23 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
 
 def _format_frontmatter(data: dict[str, Any]) -> str:
     """Dump frontmatter as YAML with a trailing ``---`` separator."""
-    return "---\n" + yaml.safe_dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True) + "---\n"
+    normalized = {k: _normalize_fm_value(v) for k, v in data.items()}
+    return "---\n" + yaml.safe_dump(normalized, default_flow_style=False, sort_keys=False, allow_unicode=True) + "---\n"
 
 
 def _format_iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_fm_value(value: Any) -> Any:
+    """Convert datetime objects to stable ISO-Z strings; leave other values alone."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return _format_iso(value)
+    if isinstance(value, list):
+        return [_normalize_fm_value(v) for v in value]
+    return value
 
 
 def _parse_tags(value: Any) -> list[str]:
@@ -114,6 +128,17 @@ def _parse_tags(value: Any) -> list[str]:
     return []
 
 
+def _decode_file(path: Path) -> tuple[dict[str, Any], str]:
+    """Return (frontmatter dict, body) for a file, handling missing frontmatter."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    split = _split_frontmatter(text)
+    if split is None:
+        return {}, text
+    fm, body = split
+    return _parse_frontmatter(fm), body
+
+
 def read_topic(topic_id: str, root: Path) -> str:
     """Return the full raw content of a topic file."""
     path = resolve(topic_id, root)
@@ -124,17 +149,6 @@ def read_topic(topic_id: str, root: Path) -> str:
             return fh.read()
     except OSError as exc:
         raise OSError(f"failed to read topic {topic_id!r}: {exc}") from exc
-
-
-def _decode_file(path: Path) -> tuple[dict[str, Any], str]:
-    """Return (frontmatter dict, body) for a file, handling missing frontmatter."""
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
-    split = _split_frontmatter(text)
-    if split is None:
-        return {}, text
-    fm, body = split
-    return _parse_frontmatter(fm), body
 
 
 def load_topic(topic_id: str, root: Path) -> dict[str, Any]:
@@ -151,8 +165,8 @@ def load_topic(topic_id: str, root: Path) -> dict[str, Any]:
     stat = path.stat()
     mtime_utc = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
 
-    created = fm.get("created") or _format_iso(mtime_utc)
-    updated = fm.get("updated") or _format_iso(mtime_utc)
+    created = _normalize_fm_value(fm.get("created")) or _format_iso(mtime_utc)
+    updated = _normalize_fm_value(fm.get("updated")) or _format_iso(mtime_utc)
 
     return {
         "id": topic_id,
@@ -179,7 +193,19 @@ def _topic_id_from_path(path: Path, root: Path) -> str:
 
 def _strip_markdown_links(text: str) -> str:
     """Remove wiki-link brackets so searches match the raw text inside them."""
-    return re.sub(r"\[\[([^\[\]]+)\]]", r"\1", text)
+    return re.sub(r"\[\[([^\[]]+)\]]", r"\1", text)
+
+
+def _extract_content_frontmatter(content: str) -> tuple[dict[str, Any], str]:
+    """If a model supplies content with a leading ``---`` block, parse it and
+    return the remaining body so the server can write a single merged frontmatter
+    block instead of two.
+    """
+    split = _split_frontmatter(content)
+    if split is None:
+        return {}, content
+    fm_text, body = split
+    return _parse_frontmatter(fm_text), body
 
 
 def discover_topics(
@@ -191,7 +217,7 @@ def discover_topics(
     """List topics, optionally filtered.
 
     Returns ``(topics, total_before_limit)`` so the caller can report truncation.
-    Each topic dict contains: id, title, tags, updated, size, snippet.
+    Each topic dict contains: id, title, tags, updated, size, snippet, outbound_links.
     """
     root = root.resolve()
     query = query.strip().lower() if query else None
@@ -205,7 +231,11 @@ def discover_topics(
         fm, body = _decode_file(path)
         title = (fm.get("title") or topic_id)
         tags = _parse_tags(fm.get("tags"))
-        updated = fm.get("updated") or fm.get("created") or _format_iso(datetime.utcfromtimestamp(path.stat().st_mtime))
+        updated = (
+            _normalize_fm_value(fm.get("updated"))
+            or _normalize_fm_value(fm.get("created"))
+            or _format_iso(datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc))
+        )
 
         tag_match = True
         if tag is not None:
@@ -240,13 +270,12 @@ def discover_topics(
                 "updated": updated,
                 "size": path.stat().st_size,
                 "snippet": snippet,
+                "outbound_links": parse_wiki_links(body),
             },
         ))
 
-    # Sort: title/id hits first (True < False), then by updated-time descending.
-    # Reversing both fields puts newest first and keeps hits above non-hits.
-    matches.sort(key=lambda t: (not t[0], t[1]["updated"]))
-    matches.reverse()
+    # Sort: title/id/tag hits first, then newest updated first.
+    matches.sort(key=lambda t: (t[0], t[1]["updated"]), reverse=True)
     topics = [m[1] for m in matches]
     total = len(topics)
     return topics[:limit], total
@@ -266,34 +295,56 @@ def write_topic(
     """
     path = resolve(topic_id, root)
     now = _format_iso(datetime.now(timezone.utc))
-    created: str | None = None
 
-    byte_count = len(content.encode("utf-8"))
+    content_fm, body = _extract_content_frontmatter(content)
+    # For size guard, count only the body the server will actually store.
+    byte_count = len(body.encode("utf-8"))
     if byte_count > MAX_TOPIC_BYTES:
         raise ValueError(
-            f"topic {topic_id!r} is {byte_count} bytes, exceeding the {MAX_TOPIC_BYTES} byte limit; "
+            f"topic {topic_id!r} body is {byte_count} bytes, exceeding the {MAX_TOPIC_BYTES} byte limit; "
             "split it across multiple topics."
         )
 
     existed = path.exists()
+    existing_fm: dict[str, Any] = {}
+    created: str | None = None
     if existed:
         existing_fm, _ = _decode_file(path)
-        created = existing_fm.get("created")
+        created = _normalize_fm_value(existing_fm.get("created"))
 
-    if title is None:
-        title = topic_id
-    if tags is None:
-        tags = []
+    # Precedence: explicit tool args > content frontmatter > existing frontmatter > defaults.
+    resolved_title = title
+    if resolved_title is None:
+        resolved_title = content_fm.get("title") or existing_fm.get("title")
+    if not resolved_title:
+        resolved_title = topic_id
 
-    fm = {
-        "title": title,
-        "tags": tags,
-        "created": created or now,
-        "updated": now,
-    }
+    resolved_tags: list[str]
+    if tags is not None:
+        resolved_tags = tags
+    elif content_fm.get("tags") is not None:
+        resolved_tags = _parse_tags(content_fm.get("tags"))
+    elif existing_fm.get("tags") is not None:
+        resolved_tags = _parse_tags(existing_fm.get("tags"))
+    else:
+        resolved_tags = []
 
-    body = content.rstrip() + ("\n" if content and not content.endswith("\n") else "")
-    full_text = _format_frontmatter(fm) + body
+    # Preserve custom frontmatter keys from both existing and content, with content overriding.
+    new_fm: dict[str, Any] = {}
+    for k, v in existing_fm.items():
+        if k not in _SERVER_KEYS and k not in ("title", "tags"):
+            new_fm[k] = v
+    for k, v in content_fm.items():
+        if k not in _SERVER_KEYS and k not in ("title", "tags"):
+            new_fm[k] = v
+
+    new_fm["title"] = resolved_title
+    new_fm["tags"] = resolved_tags
+    new_fm["created"] = created or now
+    new_fm["updated"] = now
+
+    body = body.rstrip() + ("\n" if body and not body.endswith("\n") else "")
+    full_text = _format_frontmatter(new_fm) + body
 
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(path, full_text)
@@ -356,6 +407,9 @@ def edit_topic(
     new_body = body.replace(old, new, -1 if replace_all else 1)
 
     fm["updated"] = _format_iso(datetime.now(timezone.utc))
+    # Ensure title exists so a previously frontmatter-less file gets a valid header.
+    if "title" not in fm:
+        fm["title"] = topic_id
     result = _format_frontmatter(fm) + new_body
 
     _atomic_write(path, result)

@@ -186,3 +186,96 @@ def test_wiki_links_extracted(tmp_path: Path) -> None:
     assert store.parse_wiki_links("See [[people/garland]].") == ["people/garland"]
     topic = store.load_topic("web", tmp_path)
     assert "people/garland" in topic["outbound_links"]
+
+
+# ---------------------------------------------------------------------------
+# regression tests for spec gaps
+
+
+def test_write_topic_strips_embedded_frontmatter(tmp_path: Path) -> None:
+    """If the model puts a leading frontmatter block in content, merge it into the
+    server's single block instead of writing two blocks.
+    """
+    content = "---\ntitle: FromContent\ncustom: keepme\n---\nbody here"
+    store.write_topic("mixed", content, tmp_path, title="ToolTitle", tags=["t"])
+    raw = (tmp_path / "mixed.md").read_text()
+    # Should be one frontmatter block; the body frontmatter must not be duplicated.
+    assert raw.startswith("---\n")
+    assert raw.count("\n---\n") == 1
+    assert "title: ToolTitle" in raw
+    assert "custom: keepme" in raw
+    fm, body = store._decode_file(tmp_path / "mixed.md")  # type: ignore[attr-defined]
+    assert body.strip() == "body here"
+    assert fm["tags"] == ["t"]
+
+
+def test_write_topic_preserves_custom_frontmatter_keys(tmp_path: Path) -> None:
+    """Replacing a topic must keep unknown frontmatter keys unless the new content
+    explicitly overrides them.
+    """
+    store.write_topic("keep", "---\ncustom: secret\n---\nbody1", tmp_path, title="Keep")
+    store.write_topic("keep", "body2", tmp_path)
+    fm, _ = store._decode_file(tmp_path / "keep.md")  # type: ignore[attr-defined]
+    assert fm["custom"] == "secret"
+    assert "body2" in (tmp_path / "keep.md").read_text()
+
+
+def test_resolve_preserves_inner_dots(tmp_path: Path) -> None:
+    path = store.resolve("atlas-ui-v1.2.3", tmp_path)
+    assert path.name == "atlas-ui-v1.2.3.md"
+
+
+def test_resolve_rejects_trash_route(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"\.trash.*reserved"):
+        store.resolve(".trash/secret", tmp_path)
+
+
+def test_read_topic_rejects_trash(tmp_path: Path) -> None:
+    # The resolve step must block the reserved .trash namespace before any read.
+    (tmp_path / ".trash").mkdir()
+    (tmp_path / ".trash" / "leak.md").write_text("oops")
+    with pytest.raises(ValueError, match=r"\.trash.*reserved"):
+        store.read_topic(".trash/leak", tmp_path)
+
+
+def test_created_timestamp_is_stable_iso_z(tmp_path: Path) -> None:
+    _, created = store.write_topic("stable", "body", tmp_path, title="Stable")
+    assert created
+    topic = store.load_topic("stable", tmp_path)
+    assert topic["created"].endswith("Z")
+    assert topic["updated"].endswith("Z")
+    # A second rewrite must keep the original created value and format.
+    created_before = topic["created"]
+    store.write_topic("stable", "body2", tmp_path)
+    topic2 = store.load_topic("stable", tmp_path)
+    assert topic2["created"] == created_before
+
+
+def test_existing_datetime_frontmatter_is_normalized(tmp_path: Path) -> None:
+    (tmp_path / "legacy.md").write_text(
+        "---\ntitle: Legacy\ncreated: 2026-08-05 12:00:00+00:00\nupdated: 2026-08-05 13:00:00+00:00\n---\nlegacy body"
+    )
+    store.write_topic("legacy", "new body", tmp_path)
+    fm, _ = store._decode_file(tmp_path / "legacy.md")  # type: ignore[attr-defined]
+    assert isinstance(fm["created"], str)
+    assert fm["created"].endswith("Z")
+    assert isinstance(fm["updated"], str)
+
+
+def test_discover_topics_ranks_title_and_id_hits_first(tmp_path: Path) -> None:
+    store.write_topic("alpha", "the search query appears here", tmp_path, title="A")
+    store.write_topic("search-results", "irrelevant body", tmp_path, title="Search Results")
+    # alpha was written second but is a body-only hit; it should still fall below
+    # search-results because a title/id hit is ranked higher.
+    topics, total = store.discover_topics(tmp_path, query="search", limit=10)
+    assert total == 2
+    ids = [t["id"] for t in topics]
+    assert ids[0] == "search-results"
+    assert ids[1] == "alpha"
+
+
+def test_discover_topics_returns_outbound_links(tmp_path: Path) -> None:
+    store.write_topic("hub", " Points to [[people/garland]] and [[projects/atlas-ports]].", tmp_path)
+    topics, total = store.discover_topics(tmp_path, limit=10)
+    assert total == 1
+    assert topics[0]["outbound_links"] == ["people/garland", "projects/atlas-ports"]
