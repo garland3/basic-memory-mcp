@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Runtime data directory
+memory/
