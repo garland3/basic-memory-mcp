@@ -20,7 +20,8 @@ _DEFAULT_INSTRUCTIONS = (
     "modeled on the Claude Code Edit tool: the old string must match exactly, and "
     "it fails if it appears more than once unless replace_all is true. "
     "delete moves topics to a .trash folder and never unlinks them. "
-    "Internal wiki links use [[topic-id]]."
+    "Internal wiki links use [[topic-id]]. "
+    "If write content includes frontmatter, the server merges it into its own managed block."
 )
 
 mcp = FastMCP("basic-memory-mcp", instructions=_DEFAULT_INSTRUCTIONS)
@@ -41,7 +42,7 @@ def discover_topics(
 ) -> str:
     """List available topics. Call this before read/write/edit/delete.
 
-    Returns a JSON list of {id, title, tags, updated, size, snippet}, newest first.
+    Returns a JSON list of {id, title, tags, updated, size, snippet, outbound_links}, newest first.
     If query or tag filters are given, only matching topics are returned. Reports
     when results are truncated by limit.
     """
