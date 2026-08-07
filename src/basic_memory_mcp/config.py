@@ -10,6 +10,7 @@ class ServerConfig:
     read_only: bool = False
     hard_delete: bool = False
     sweep_on_start: bool = False
+    multi_tenant: bool = False
     host: str = "127.0.0.1"
     port: int = 8101
 

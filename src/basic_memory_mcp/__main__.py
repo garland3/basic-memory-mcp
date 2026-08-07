@@ -41,6 +41,7 @@ def main() -> None:
         "read_only": _env_bool("BASIC_MEMORY_READ_ONLY", False),
         "hard_delete": _env_bool("BASIC_MEMORY_HARD_DELETE", False),
         "sweep_on_start": _env_bool("BASIC_MEMORY_SWEEP_ON_START", False),
+        "multi_tenant": _env_bool("BASIC_MEMORY_MULTI_TENANT", False),
     }
 
     parser = argparse.ArgumentParser(
@@ -67,6 +68,11 @@ def main() -> None:
         "--sweep-on-start",
         action="store_true",
         help="Sweep expired topics into .trash on startup",
+    )
+    parser.add_argument(
+        "--multi-tenant",
+        action="store_true",
+        help="Namespace all topics per injected _atlas_user email (ATLAS deployments only)",
     )
     parser.add_argument(
         "--host",
@@ -111,6 +117,7 @@ def main() -> None:
         read_only=defaults["read_only"] or args.read_only,
         hard_delete=defaults["hard_delete"] or args.hard_delete,
         sweep_on_start=defaults["sweep_on_start"] or args.sweep_on_start,
+        multi_tenant=defaults["multi_tenant"] or args.multi_tenant,
         host=args.host,
         port=args.port,
     )
@@ -119,7 +126,15 @@ def main() -> None:
     register_tools(cfg)
 
     if cfg.sweep_on_start:
-        swept = store.sweep_expired(cfg.root, dry_run=False)
+        if cfg.multi_tenant:
+            # Sweep each tenant folder separately so expired topics land in the
+            # tenant's own .trash rather than a shared one.
+            swept = []
+            for child in sorted(root.iterdir()):
+                if child.is_dir() and not child.name.startswith("."):
+                    swept.extend(store.sweep_expired(child, dry_run=False))
+        else:
+            swept = store.sweep_expired(cfg.root, dry_run=False)
         if swept:
             print(f"basic-memory-mcp: swept {len(swept)} expired topic(s)", file=sys.stderr)
 

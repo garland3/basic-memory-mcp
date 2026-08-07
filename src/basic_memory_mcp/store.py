@@ -16,6 +16,9 @@ _TRASH_DIR = ".trash"
 _SERVER_KEYS = {"created", "updated"}
 _EXPIRES_NEVER = "never"
 
+# §13.3: tenant slugs must match this after sanitizing.
+_TENANT_SLUG_RE = re.compile(r"^[a-z0-9_-]+$")
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -49,6 +52,48 @@ def resolve(topic_id: str, root: Path) -> Path:
         raise ValueError(f"topic id resolves outside server root: {topic_id!r}") from exc
 
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# §13 multi-tenancy
+
+
+def sanitize_tenant(email: str) -> str:
+    """Map an injected ``_atlas_user`` email to a filesystem-safe tenant slug.
+
+    Lowercases, maps ``@`` and ``.`` to ``_``, and rejects anything that does
+    not match ``[a-z0-9_-]+`` after sanitizing — so the slug is always a single
+    safe path segment (no separators, no ``..``, no leading dot).
+    ``garland3@gmail.com`` -> ``garland3_gmail_com``.
+
+    Note (accepted, §13.5): ``a.b@c.d`` and ``a_b@c_d`` sanitize to the same
+    slug. Emails are the trust boundary and ATLAS authenticates them, so this
+    collision requires two authenticated users with pathological addresses.
+    """
+    slug = str(email).strip().lower().replace("@", "_").replace(".", "_")
+    if not slug or not _TENANT_SLUG_RE.match(slug):
+        raise ValueError(
+            f"_atlas_user value {email!r} is not usable as a tenant id: "
+            "must match [a-z0-9_-]+ after lowercasing and mapping '@'/'.' to '_'"
+        )
+    return slug
+
+
+def tenant_root(root: Path, atlas_user: str | None, multi_tenant: bool) -> Path:
+    """Return the effective memory root for a call.
+
+    With ``multi_tenant`` off this is simply ``root``. With it on, the injected
+    email is sanitized and appended as a path segment; a missing or empty value
+    is refused loudly rather than silently mapped to a shared/default tenant.
+    """
+    if not multi_tenant:
+        return root
+    if atlas_user is None or not str(atlas_user).strip():
+        raise ValueError(
+            "_atlas_user is required: the server is running with --multi-tenant "
+            "but no user identity was injected by the Atlas backend"
+        )
+    return root / sanitize_tenant(atlas_user)
 
 
 def _iter_topics(root: Path) -> list[Path]:
