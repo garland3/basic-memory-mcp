@@ -480,3 +480,90 @@ in-process timer is not.
 - An expired topic is absent from priming and default discovery, present with
   `include_expired=true`, and still readable by id.
 - `append` to an expiring topic extends its life and never shortens it.
+
+## 13. Phase 3 — optional multi-tenancy via `_atlas_user` (off by default)
+
+§9 excluded multi-user namespacing from the core build, and that stays true for
+the default configuration. This section adds it as an **opt-in flag** for the
+ATLAS deployment specifically, because ATLAS already has a clean, spoof-proof way
+to tell the server who is calling.
+
+### 13.1 How ATLAS injects the user (looked up, not guessed)
+
+The mechanism lives in `atlas-ui-3` and is *schema-driven*:
+
+- A tool opts in by declaring a parameter literally named `_atlas_user` in its
+  schema. `tool_accepts_atlas_user()`
+  (`atlas/application/chat/utilities/tool_executor.py:301`) inspects the tool's
+  JSON schema `properties` for that key.
+- If present, the backend sets `parsed_args["_atlas_user"] = user_email`
+  (`tool_executor.py:744-745`), where `user_email` is the authenticated user's
+  email from the session context (`X-User-Email` header upstream).
+- Anything the **model** supplied for `_atlas_user` is stripped and re-injected
+  server-side (`atlas/modules/mcp_tools/mcp_execution.py:630-633`), so the LLM
+  cannot impersonate another user. The working demo is
+  `atlas-ui-3/atlas/mcp/username-override-demo/main.py`.
+
+So the contract is simply: *declare the parameter and ATLAS fills it*. No
+handshake, no auth code in this server.
+
+### 13.2 Design: `--multi-tenant` flag
+
+```
+basic-memory-mcp --stdio --root ... --multi-tenant
+```
+
+- **Off (default):** tool signatures are exactly the §3 shapes — no
+  `_atlas_user` parameter exists anywhere. This matters for the common case:
+  most clients are a local Claude Code / Cursor / whatever running the server on
+  their own machine. They have no injector, would see a weird underscore
+  parameter they don't understand, and might try to fill it. Absent-by-default
+  means the schema-driven injection simply never triggers and local behavior is
+  byte-identical to today.
+- **On:** every tool grows a trailing
+  `_atlas_user: str | None = None` parameter (docstring: "injected by the Atlas
+  backend; do not supply"). The store then resolves all topic ids under
+  `<root>/<tenant>/` instead of `<root>/`.
+
+The flag changes *registered schemas*, not runtime branching inside one schema —
+same pattern as `--read-only` in §6, which unregisters tools rather than
+registering-and-failing.
+
+### 13.3 Tenant → folder mapping
+
+- Tenant key is the injected email, sanitized to a filesystem-safe slug:
+  lowercase, `@` and `.` → `_`, reject anything that doesn't match
+  `[a-z0-9_-]+` after sanitizing. `garland3@gmail.com` →
+  `garland3_gmail_com/`.
+- The slug becomes a path segment **prepended by the server**, never taken from
+  a topic id — the §3 `resolve()` escape rules apply after prepending, so one
+  tenant can never name another tenant's files.
+- Each tenant gets their own `.trash/` under their folder; `sweep`, priming
+  (§11.4), and `discover_topics` are all scoped to the calling tenant.
+- `_atlas_user` missing or `None` while `--multi-tenant` is on → the call is
+  **refused** with a clear error, not silently mapped to a shared/default
+  tenant. A misconfigured deployment should fail loudly rather than mingle
+  users' memories.
+
+### 13.4 What this deliberately is not
+
+- Not security against a hostile client — stdio gives whoever spawns the
+  process the whole folder anyway. It is *namespacing* for the trusted-ATLAS
+  case, where the backend injection is the only source of the tenant id.
+- Not enabled in the §8 ATLAS registration until there is actually a second
+  user; single-user ATLAS keeps the flat layout so existing topic ids and the
+  hand-editability story (§1) are untouched.
+- No migration tool. Turning the flag on over an existing flat root leaves old
+  topics invisible; moving them under a tenant folder is a one-time `mv` the
+  README documents.
+
+### 13.5 Done means
+
+- With the flag off, `list_tools` schemas contain no `_atlas_user` anywhere.
+- With the flag on, every tool declares it, and a call without it errors.
+- Two different injected emails see disjoint catalogs, trashes, and primed
+  instructions; a `[[link]]` written by tenant A resolves only within A.
+- A sanitized-slug collision test: `a.b@c.d` and `a_b@c_d` map to the same slug
+  — document this as accepted (emails are the trust boundary, ATLAS
+  authenticates them; the collision requires two *authenticated* users with
+  pathological addresses).
