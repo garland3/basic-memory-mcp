@@ -18,9 +18,13 @@ Topic ids are slash-paths relative to `--root` without `.md`, e.g. `projects/atl
 # stdio (default)
 basic-memory-mcp --stdio --root ~/ATLAS-GROUP/basic-memory/memory
 
-# HTTP
-basic-memory-mcp --http --host 127.0.0.1 --port 8101 --root ...
+# HTTP with static bearer-token authorization
+ATLAS_MCP_TOKEN=replace-with-a-secret basic-memory-mcp --http --host 127.0.0.1 --port 8101 --root ...
 ```
+
+HTTP clients must send the configured token as `Authorization: ******
+For local debugging only, set `DEBUG=true` to disable HTTP authorization. Stdio
+transport does not require `ATLAS_MCP_TOKEN`.
 
 Set `BASIC_MEMORY_READ_ONLY=1` or `--read-only` to expose only `discover_topics` and `read`.
 Set `BASIC_MEMORY_HARD_DELETE=1` or `--hard-delete` to unlink files instead of moving them

@@ -5,9 +5,36 @@ import os
 import sys
 from pathlib import Path
 
+from fastmcp.server.auth import StaticTokenVerifier
+
 from . import store
 from .config import ServerConfig, set_config
 from .server import mcp, register_tools
+
+
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+
+def _build_auth() -> StaticTokenVerifier | None:
+    if DEBUG:
+        return None
+
+    token = os.getenv("ATLAS_MCP_TOKEN")
+    if not token:
+        raise ValueError(
+            "ATLAS_MCP_TOKEN environment variable is not set. "
+            "Set it to a non-empty token before starting the HTTP server."
+        )
+
+    return StaticTokenVerifier(
+        tokens={
+            token: {
+                "user_id": "atlas-ui",
+                "client_id": "atlas-ui-backend",
+                "scopes": ["read", "write"],
+            }
+        }
+    )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -139,6 +166,7 @@ def main() -> None:
             print(f"basic-memory-mcp: swept {len(swept)} expired topic(s)", file=sys.stderr)
 
     if transport == "http":
+        mcp.auth = _build_auth()
         mcp.run(transport="http", host=cfg.host, port=cfg.port)
     else:
         mcp.run(transport="stdio", show_banner=False)
