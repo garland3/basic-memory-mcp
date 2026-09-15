@@ -340,18 +340,51 @@ def _extract_content_frontmatter(content: str) -> tuple[dict[str, Any], str]:
 # Query parsing and snippet helpers (§11.3, §11.5)
 
 
+# Filler words dropped from an unquoted query before the AND match. Models tend
+# to pass a whole natural-language question ("what port does the atlas ui run
+# on?"); because terms are ANDed as literal substrings, every filler word is one
+# more way for the query to match nothing. Dropping them turns such a question
+# into the two or three words that actually discriminate. Kept deliberately
+# small: only closed-class words that carry no topic meaning. Words that look
+# like filler but are real subjects here ("all", "log", "set") are NOT included.
+#
+# TODO: this is a crude stand-in for semantic search. The real fix is to embed
+# topics and rank by vector similarity, which would make a full-sentence query
+# the *best* input instead of the worst, and make this stopword list and the
+# AND-everything rule unnecessary. See also the query guidance in server.py.
+_STOPWORDS = frozenset(
+    """
+    a about an and any are as at be been but by can did do does doing done for
+    from get had has have how i if in into is it its me my of on or our over
+    should so some tell that the their then there these they this those to under
+    up us was we were what when where which who why will with would you your
+    """.split()
+)
+
+# Trailing/leading punctuation stripped from each term, so "8080?" matches 8080.
+_TERM_PUNCT = "?!.,;:()[]{}'\"`"
+
+
 def _query_terms(query: str | None) -> tuple[list[str], bool]:
-    """Split a query into terms.
+    """Split a query into terms, dropping filler words.
 
     Returns ``(terms, phrase)`` where ``phrase`` is true when the query is a
-    single quoted string that should be matched exactly.
+    single quoted string that should be matched exactly (no filtering is applied
+    in that case -- an explicit phrase is taken at face value).
+
+    Unquoted queries have surrounding punctuation and `_STOPWORDS` removed. If
+    every term is filler, the original terms are kept rather than returning an
+    empty query that would match everything.
     """
     if not query:
         return [], False
     q = query.strip()
     if len(q) >= 2 and q.startswith('"') and q.endswith('"') and q.count('"') == 2:
         return [q[1:-1]], True
-    return [t for t in q.split() if t], False
+    raw = [t.strip(_TERM_PUNCT) for t in q.split()]
+    raw = [t for t in raw if t]
+    kept = [t for t in raw if t.lower() not in _STOPWORDS]
+    return (kept or raw), False
 
 
 def _term_matches(topic_id: str, title: str, tags: list[str], body: str, term: str) -> dict[str, bool]:

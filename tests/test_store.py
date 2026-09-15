@@ -544,3 +544,32 @@ def test_invalid_retention_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="invalid retention"):
         store.write_topic("x", "x", tmp_path, retention="nonsense")
 
+
+
+def test_discover_drops_filler_words_from_sentence_query(tmp_path: Path) -> None:
+    store.write_topic(
+        "atlas", "the ui does not run on port 8080", tmp_path, title="Atlas ports"
+    )
+    # Without filler-word removal the ANDed terms ("what", "does", ...) match nothing.
+    topics, total, _hidden = store.discover_topics(
+        tmp_path, query="What port does the atlas UI run on?", limit=10
+    )
+    assert total == 1
+    assert topics[0]["id"] == "atlas"
+
+
+def test_discover_all_filler_query_keeps_original_terms(tmp_path: Path) -> None:
+    store.write_topic("a", "the quick note", tmp_path, title="A")
+    store.write_topic("b", "unrelated", tmp_path, title="B")
+    # Every term is filler, so the query is honored literally rather than dropped.
+    topics, total, _hidden = store.discover_topics(tmp_path, query="the", limit=10)
+    assert total == 1
+    assert topics[0]["id"] == "a"
+
+
+def test_discover_quoted_phrase_keeps_filler_words(tmp_path: Path) -> None:
+    store.write_topic("a", "notes about the port", tmp_path, title="A")
+    store.write_topic("b", "notes about a port", tmp_path, title="B")
+    topics, total, _hidden = store.discover_topics(tmp_path, query='"the port"', limit=10)
+    assert total == 1
+    assert topics[0]["id"] == "a"

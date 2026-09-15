@@ -25,6 +25,10 @@ _DEFAULT_INSTRUCTIONS = (
     "Persistent notebook tools. Topic ids are slash-paths relative to the memory root, "
     "without '.md', e.g. 'projects/atlas-ports'. Always call discover_topics first "
     "to see what is known, or use related to follow wiki-link relationships. "
+    "discover_topics is keyword, not semantic: call it with no query and read the "
+    "returned titles, which is more reliable than guessing search words. Only add a "
+    "query to narrow a long list, and then use 1-2 distinctive keywords rather than "
+    "a sentence. "
     "read returns the full Markdown file with frontmatter. "
     "write creates or replaces a topic; it overwrites without asking, so use edit "
     "when you only need to change a few lines. append adds one fact to the end of an "
@@ -298,12 +302,16 @@ def _sweep_impl(root: Path, dry_run: bool) -> str:
 
 
 def discover_topics(
-    query: Annotated[str | None, Field(description="Optional case-insensitive AND search across id, title, tags, and body. Quoted \"exact phrase\" matches as a single term.")] = None,
+    query: Annotated[str | None, Field(description="Optional keyword filter. Literal substring matching, NOT semantic: terms are ANDed across id, title, tags, and body, so a whole natural-language sentence usually matches nothing. Prefer no query at all and read the list; otherwise pass 1-2 distinctive keywords ('atlas port', '8080'). Common filler words are dropped. Quoted \"exact phrase\" matches as a single literal term.")] = None,
     tag: Annotated[str | None, Field(description="Optional exact tag match")] = None,
     limit: Annotated[int, Field(description="Maximum topics to return", ge=1, le=500)] = 50,
     include_expired: Annotated[bool, Field(description="Include topics whose expiry has passed")] = False,
 ) -> str:
     """List available topics. Call this before read/write/edit/delete/append/rename/sweep.
+
+    Prefer calling this with no query: the returned titles are usually a better
+    guide than a guessed keyword. The query is a literal AND substring filter,
+    not semantic search, so a full sentence will normally match nothing.
 
     Returns a JSON list of {id, title, tags, updated, size, snippet, outbound_links,
     expires, match_reason}, newest first. With a query, snippets are centered on the first
@@ -443,7 +451,7 @@ def sweep(
 
 
 def discover_topics_mt(
-    query: Annotated[str | None, Field(description="Optional case-insensitive AND search across id, title, tags, and body. Quoted \"exact phrase\" matches as a single term.")] = None,
+    query: Annotated[str | None, Field(description="Optional keyword filter. Literal substring matching, NOT semantic: terms are ANDed across id, title, tags, and body, so a whole natural-language sentence usually matches nothing. Prefer no query at all and read the list; otherwise pass 1-2 distinctive keywords ('atlas port', '8080'). Common filler words are dropped. Quoted \"exact phrase\" matches as a single literal term.")] = None,
     tag: Annotated[str | None, Field(description="Optional exact tag match")] = None,
     limit: Annotated[int, Field(description="Maximum topics to return", ge=1, le=500)] = 50,
     include_expired: Annotated[bool, Field(description="Include topics whose expiry has passed")] = False,
