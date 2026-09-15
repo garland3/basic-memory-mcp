@@ -12,6 +12,10 @@ from pydantic import Field
 from . import store
 from .config import ServerConfig, get_config
 
+# Short usage note appended to every discover_topics result. Lives in a
+# sibling .md so it can be edited without touching Python.
+_DISCOVER_GUIDANCE_PATH = Path(__file__).with_name("discover_guidance.md")
+
 # Tracks concrete memory:// resources that have been registered via _refresh_catalog.
 # Map: topic_id -> URI string.
 _memory_resources: dict[str, str] = {}
@@ -147,6 +151,14 @@ def _tenant_root(atlas_user: str | None) -> Path:
 # the two families is how the root is resolved.
 
 
+def _discover_guidance() -> str:
+    """Return the discover_topics trailer, or empty if the sidecar file is missing."""
+    try:
+        return _DISCOVER_GUIDANCE_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _discover_topics_impl(
     root: Path,
     query: str | None,
@@ -171,6 +183,9 @@ def _discover_topics_impl(
         extra.append(f"{expired_hidden} expired topics hidden; pass include_expired=true")
     if extra:
         out += "\n(" + "; ".join(extra) + ")"
+    guidance = _discover_guidance()
+    if guidance:
+        out += "\n\n" + guidance
     return out
 
 
@@ -295,6 +310,7 @@ def discover_topics(
     body match. Expired topics are hidden by default; pass include_expired=true to reveal
     them, marked with "expired": true.
     Reports when results are truncated by limit or when expired topics were hidden.
+    Appends the taxonomy/write guidance from discover_guidance.md after the list.
     """
     return _discover_topics_impl(get_config().root, query, tag, limit, include_expired)
 

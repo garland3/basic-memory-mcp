@@ -62,6 +62,14 @@ def test_discover_topics_filter_by_tag(cfg):
     assert "beta" not in out
 
 
+def test_discover_topics_appends_guidance_from_md(cfg):
+    out = discover_topics()
+    assert "Keep one note per durable fact" in out
+    assert "Prefer `append` / `edit` over `write`" in out
+    assert "`people/`" in out
+    assert "`scratch/`" in out
+
+
 # ---------------------------------------------------------------------------
 # read
 
